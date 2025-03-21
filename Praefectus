@@ -1,0 +1,277 @@
+Praefectus
+
+Core Design Principles
+  * Simplicity: Minimize complexity by using native tools and clear organization. Keep configurations straightforward and well-documented.
+  * Reliability: Employ automated health checks, ZFS snapshots, and redundancy to ensure data is always protected and accessible.
+  * Efficiency: Optimize ZFS parameters for specific workloads. Use compression, deduplication, and proper recordsize settings to maximize storage efficiency.
+  * Security by Design: Implement network isolation through ZeroTier, enforce access controls, and use encryption for sensitive data.
+  * Automation First: Script routine tasks with proper error handling and logging. Use systemd timers for predictable scheduling.
+  * Separation of Concerns: Keep backup storage isolated from sandbox environments. Use separate ZFS datasets with appropriate properties for each function.
+  * Observability: Maintain comprehensive logging and monitoring. Make system status visible through Cockpit dashboards.
+  * Scalability: Design the system to grow with your needs by using flexible storage allocation and modular components.
+  * Self-healing: Leverage ZFS's self-healing capabilities and implement automated recovery procedures where possible.
+  * Purpose-driven: Every component should serve the dual mission of reliable backup storage and providing a secure sandbox for learning.
+
+Technical Implementation
+  Foundation Model
+    * Hardware:
+    * Software:
+
+Phase 1: Assessment & Cleanup
+1. Audit Existing Configuration
+    * Identify existing rsync scripts
+        * No custom rsync scripts were found in the common locations
+    * List active NFS mounts
+    * Check scheduled jobs
+        * No rsync references were found in cron jobs, system binaries, or systemd service files. This suggests there are no active or scheduled rsync jobs configured through these methods
+    * Inventory Cockpit modules: rpm -qa | grep cockpit
+2. Documentation
+    * Document current server configuration
+    * Map out ZFS pool structure: zfs list
+    * Record network configuration: ip addr and firewall-cmd --list-all
+3. Cleanup
+    * Stop and disable unnecessary services: systemctl stop <service> and systemctl disable <service>
+    * Remove NFS mounts from /etc/fstab
+    * Delete outdated rsync scripts and cron jobs
+    * Clean up synced data that isn't needed: zfs destroy or rm -rf as appropriate
+Phase 2: Storage Configuration
+1. ZFS Dataset Structure bash
+    * # Create main dataset structure
+		zfs create pool/praefectus
+		zfs create pool/praefectus/backups
+		zfs create -o compression=lz4 pool/praefectus/backups/workstations
+		zfs create pool/praefectus/icloud
+		zfs create pool/praefectus/sandbox
+		zfs create pool/praefectus/sandbox/vms
+		zfs create pool/praefectus/sandbox/containers
+
+1. ZFS Optimization
+bash
+
+1. # For backup datasets (optimize for lots of small files)
+2. zfs set recordsize=128K pool/praefectus/backups
+3. zfs set primarycache=metadata pool/praefectus/backups
+4. 
+5. # For VM storage (optimize for databases and VMs)
+6. zfs set recordsize=8K pool/praefectus/sandbox/vms
+7. 
+8. # Enable deduplication for backups if you have sufficient RAM
+9. # zfs set dedup=on pool/praefectus/backups
+10. 
+11. # Setup auto-snapshots
+12. zfs set com.sun:auto-snapshot=true pool/praefectus   
+Phase 3: Backup System Implementation
+1. Install Borg Backup bash    
+dnf install borgbackup
+Configure Borg Repositories
+bash
+
+# Initialize Borg repository
+borg init --encryption=repokey /pool/praefectus/backups/workstations/main_repo
+Create Backup Scripts
+bash
+
+# Create backup script
+cat > /usr/local/bin/backup-workstations.sh << 'EOF'
+#!/bin/bash
+
+# Borg backup script
+export BORG_PASSPHRASE='your-secure-passphrase'
+
+borg create \
+  --stats \
+  --compression lz4 \
+  /pool/praefectus/backups/workstations/main_repo::'{hostname}-{now:%Y-%m-%d}' \
+  /path/to/backup/source
+
+# Prune old backups
+borg prune \
+  --keep-daily 7 \
+  --keep-weekly 4 \
+  --keep-monthly 6 \
+  /pool/praefectus/backups/workstations/main_repo
+EOF
+
+chmod +x /usr/local/bin/backup-workstations.sh
+Setup Systemd Timer
+bash
+
+1. # Create service file
+2. cat > /etc/systemd/system/backup-workstations.service << EOF
+3. [Unit]
+4. Description=Backup Workstations with Borg
+5. 
+6. [Service]
+7. Type=oneshot
+8. ExecStart=/usr/local/bin/backup-workstations.sh
+9. 
+10. [Install]
+11. WantedBy=multi-user.target
+12. EOF
+13. 
+14. # Create timer file
+15. cat > /etc/systemd/system/backup-workstations.timer << EOF
+16. [Unit]
+17. Description=Run workstation backup daily
+18. 
+19. [Timer]
+20. OnCalendar=*-*-* 01:00:00
+21. Persistent=true
+22. 
+23. [Install]
+24. WantedBy=timers.target
+25. EOF
+26. 
+27. # Enable and start the timer
+28. systemctl enable backup-workstations.timer
+29. systemctl start backup-workstations.timer   
+Phase 4: iCloud Mirror Setup
+1. Install rclone bash    
+dnf install rclone
+Configure rclone for iCloud
+bash
+
+rclone config
+Create Mirror Script
+bash
+
+cat > /usr/local/bin/icloud-mirror.sh << 'EOF'
+#!/bin/bash
+
+# One-way sync from iCloud to local storage
+rclone sync icloud: /pool/praefectus/icloud \
+  --transfers=4 \
+  --checkers=8 \
+  --exclude "*.tmp" \
+  --log-file=/var/log/icloud-mirror.log
+
+# Create ZFS snapshot after successful sync
+if [ $? -eq 0 ]; then
+  zfs snapshot pool/praefectus/icloud@$(date +%Y-%m-%d)
+fi
+EOF
+
+chmod +x /usr/local/bin/icloud-mirror.sh
+Setup Systemd Timer for iCloud Sync
+bash
+
+1. # Create service file
+2. cat > /etc/systemd/system/icloud-mirror.service << EOF
+3. [Unit]
+4. Description=Mirror iCloud Content
+5. 
+6. [Service]
+7. Type=oneshot
+8. ExecStart=/usr/local/bin/icloud-mirror.sh
+9. 
+10. [Install]
+11. WantedBy=multi-user.target
+12. EOF
+13. 
+14. # Create timer file
+15. cat > /etc/systemd/system/icloud-mirror.timer << EOF
+16. [Unit]
+17. Description=Run iCloud mirror every 6 hours
+18. 
+19. [Timer]
+20. OnCalendar=*-*-* 00/6:00:00
+21. Persistent=true
+22. 
+23. [Install]
+24. WantedBy=timers.target
+25. EOF
+26. 
+27. # Enable and start the timer
+28. systemctl enable icloud-mirror.timer
+29. systemctl start icloud-mirror.timer   
+Phase 5: Cockpit Enhancement
+1. Install Additional Cockpit Modules bash    
+dnf install cockpit-storaged cockpit-navigator cockpit-machines cockpit-podman cockpit-packagekit
+Custom Cockpit Dashboard (optional)
+* Create a simple status page that shows:
+    * Backup status and history
+    * iCloud mirror sync status
+    * ZFS pool health
+    * Snapshot management
+Configure Cockpit for VM Management
+bash
+
+1. # Ensure libvirt is configured properly
+2. dnf install libvirt virt-manager
+3. systemctl enable libvirtd
+4. systemctl start libvirtd
+5. 
+6. # Add storage pool for VMs in ZFS
+7. virsh pool-define-as --name zfs-vms --type dir --target /pool/praefectus/sandbox/vms
+8. virsh pool-autostart zfs-vms
+9. virsh pool-start zfs-vms   
+Phase 6: Security Hardening
+1. Firewall Configuration bash    
+# Allow only ZeroTier and SSH
+firewall-cmd --permanent --zone=public --remove-service=cockpit
+firewall-cmd --permanent --zone=trusted --add-service=cockpit
+firewall-cmd --permanent --zone=trusted --add-source=<zerotier-network-range>
+firewall-cmd --reload
+Setup fail2ban
+bash
+
+dnf install fail2ban
+
+# Configure fail2ban for SSH
+cat > /etc/fail2ban/jail.d/sshd.local << EOF
+[sshd]
+enabled = true
+maxretry = 3
+bantime = 1h
+EOF
+
+systemctl enable fail2ban
+systemctl start fail2ban
+Enable ZFS Encryption (if not already set up)
+bash
+
+1. # For new datasets needing encryption
+2. zfs create -o encryption=on -o keyformat=passphrase pool/praefectus/sensitive_data   
+Phase 7: Monitoring & Maintenance
+1. ZFS Health Checks bash    
+# Create a script for regular ZFS checks
+cat > /usr/local/bin/zfs-health-check.sh << 'EOF'
+#!/bin/bash
+
+# Pool status check
+zpool status | grep -i "error\|degrad\|unavail"
+
+# Scrub pools monthly
+if [ $(date +%d) -eq 1 ]; then
+  zpool scrub pool
+fi
+EOF
+
+chmod +x /usr/local/bin/zfs-health-check.sh
+Automatic ZFS Snapshot Management
+bash
+
+# Install zfs-auto-snapshot
+dnf install zfs-auto-snapshot
+
+# Configure snapshot retention
+systemctl enable zfs-auto-snapshot-daily.timer
+systemctl start zfs-auto-snapshot-daily.timer
+Log Monitoring
+bash
+
+1. # Setup log rotation
+2. cat > /etc/logrotate.d/praefectus << EOF
+3. /var/log/icloud-mirror.log {
+4.   rotate 7
+5.   daily
+6.   compress
+7.   missingok
+8.   notifempty
+9. }
+10. EOF   
+Implementation Timeline
+1. Weekend 1: Assessment, cleanup, and ZFS configuration (Phases 1-2)
+2. Weekend 2: Backup system and iCloud mirror setup (Phases 3-4)
+3. Weekend 3: Cockpit enhancements and security hardening (Phases 5-6)
+4. Ongoing: Monitoring, testing, and refinement (Phase 7)
